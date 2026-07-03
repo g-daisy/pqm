@@ -24,6 +24,8 @@ logs/
 # Database
 *.db
 *.sqlite
+*documents
+
 
 # Frontend
 frontend/node_modules/

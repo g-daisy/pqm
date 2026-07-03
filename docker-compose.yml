@@ -23,8 +23,10 @@ services:
       DB_HOST: postgres
       DB_PORT: 5432
     volumes:
+      - ./app:/app/app
       - ./documents:/app/documents
       - ./logs:/app/logs
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
     depends_on:
       postgres:
         condition: service_healthy
@@ -34,6 +36,8 @@ services:
     restart: unless-stopped
     ports:
       - "80:80"
+    volumes:
+      - ./frontend/dist:/usr/share/nginx/html
     depends_on:
       - backend
 
