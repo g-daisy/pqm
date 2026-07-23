@@ -1,160 +1,100 @@
-"""
-=============================================================================
-Agent API 路由 (api/agent.py)
-=============================================================================
-
-【用途】
-提供 Agent 查询接口，基于 LangGraph 多 Agent 系统。
-
-【接口】
-POST /api/v1/agent/query - 执行自然语言查询（多 Agent 协作）
-POST /api/v1/agent/cancel/{session_id} - 中断正在运行的查询
-POST /api/v1/agent/resume/{session_id} - 从最近 checkpoint 继续未完成的查询
-GET  /api/v1/agent/health - 检查 Agent 服务状态
-GET  /api/v1/agent/history - 获取对话历史
-DELETE /api/v1/agent/history - 清除会话历史
-
-【多 Agent 架构】
-Coordinator (意图识别) → SQL Agent / RAG Agent
-                         ↓
-                    Critic Agent (审查)
-                         ↓
-                    SQL Executor
-                         ↓
-                    Result Aggregation
-"""
+"""Agent API routes — WorkerPool + agent_loop based."""
 import asyncio
 import json
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 
-from app.core.pqm_graph import run_pqm_graph, run_pqm_graph_stream, pqm_graph
-from app.memory.short_term_memory import session_memory
+from app.memory.persistent_session import session_memory
 from app.api.monitor import increment_query_count
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-
 router = APIRouter(prefix="/agent", tags=["Agent"])
-
-STEP_LABELS = {
-    "coordinator": "正在理解问题...",
-    "sql_generation": "正在生成查询语句...",
-    "critic": "正在审查 SQL...",
-    "sql_execution": "正在执行数据库查询...",
-    "rag_retrieval": "正在检索知识库...",
-    "result_aggregation": "正在整合结果...",
-    "response_optimization": "正在优化回复...",
-}
-
-
-# 同一 session 同时只能有一个运行中的 graph 任务
-_running_tasks: Dict[str, asyncio.Task] = {}
 
 
 # =============================================================================
 # 请求/响应模型
 # =============================================================================
 class QueryRequest(BaseModel):
-    """查询请求"""
     question: str = Field(..., description="用户问题")
-    session_id: str = Field(default="default", description="Session ID，用于记忆管理")
-    mode: str = Field(default="auto", description="模式: auto=自动识别, sql=仅SQL, rag=仅RAG")
+    session_id: str = Field(default="default", description="Session ID")
+    mode: str = Field(default="auto", description="模式")
 
 
 class QueryResponse(BaseModel):
-    """查询响应"""
     success: bool
     question: str
     session_id: str
-    intent: str
-    sql: Optional[str] = None
-    data: Optional[List[Dict[str, Any]]] = None
-    count: int = 0
-    error: Optional[str] = None
     answer: Optional[str] = None
-    pdf_urls: Optional[List[str]] = Field(default=None, description="相关 SIP PDF 文件 URL 列表")
     cancelled: bool = False
 
 
 class HistoryResponse(BaseModel):
-    """历史记录响应"""
     session_id: str
     history: List[Dict[str, Any]]
     turn_count: int
 
 
 class HealthResponse(BaseModel):
-    """健康检查响应"""
     status: str
-    graph_ready: bool
     memory_sessions: int
+
+
+class SessionInfo(BaseModel):
+    session_id: str
+    title: Optional[str] = None
+    turn_count: int = 0
+    last_active: Optional[str] = None
+
+
+class CreateSessionRequest(BaseModel):
+    session_id: str
+    title: str = ""
 
 
 # =============================================================================
 # 内部工具
 # =============================================================================
-def _build_response(result: Dict[str, Any], session_id: str, question: str) -> QueryResponse:
-    """从 graph 最终 state 构建 QueryResponse"""
-    sql_domain = result.get("sql", {})
-    result_domain = result.get("result", {})
-    sql_result = sql_domain.get("sql_result")
-    sql_error = sql_domain.get("sql_error")
-    success = sql_result.get("success", False) if sql_result else False
+async def _submit_and_wait(question: str, session_id: str) -> asyncio.Queue:
+    from app.main import worker_pool
+    from app.runtime.task import Task
 
-    return QueryResponse(
-        success=success,
-        question=result.get("question", question),
-        session_id=result.get("session_id", session_id),
-        intent=result.get("intent", "unknown"),
-        sql=sql_domain.get("generated_sql"),
-        data=sql_result.get("data") if sql_result else None,
-        count=sql_result.get("count", 0) if sql_result else 0,
-        error=sql_error,
-        answer=result_domain.get("final_response") or result_domain.get("raw_response") or _build_answer(result),
-        pdf_urls=sql_result.get("pdf_urls", []) if sql_result else [],
-    )
-
-
-def _cancelled_response(session_id: str, question: str) -> QueryResponse:
-    """构造被取消的响应"""
-    return QueryResponse(
-        success=False,
-        question=question,
+    result_queue: asyncio.Queue = asyncio.Queue()
+    task = Task(
+        task_type="chat",
         session_id=session_id,
-        intent="unknown",
-        answer="（已停止）",
-        cancelled=True,
+        input={"question": question, "messages": []},
+        result_queue=result_queue,
     )
+    await worker_pool.submit(task)
+    return result_queue
 
 
-async def _cancel_existing_task(session_id: str) -> None:
-    """如果该 session 有正在运行的任务，取消并等待其结束。"""
-    existing = _running_tasks.get(session_id)
-    if existing is None or existing.done():
-        return
-    logger.info(f"Cancelling existing task for session {session_id}")
-    existing.cancel()
-    try:
-        await existing
-    except (asyncio.CancelledError, Exception):
-        pass
+async def _stream_from_queue(queue: asyncio.Queue):
+    """Yield SSE data lines from a WorkerPool result queue."""
+    while True:
+        try:
+            event = await asyncio.wait_for(queue.get(), timeout=120.0)
+        except asyncio.TimeoutError:
+            yield f"data: {json.dumps({'type': 'error', 'error': '请求超时'}, ensure_ascii=False)}\n\n"
+            break
 
-
-async def _run_with_registry(session_id: str, coro):
-    """把 coroutine 包成 task 注册到 registry，等待并清理。"""
-    task = asyncio.create_task(coro)
-    _running_tasks[session_id] = task
-    try:
-        return await task
-    finally:
-        # 仅当 registry 里仍指向我们这个 task 时才清理（防止后续任务被误清）
-        if _running_tasks.get(session_id) is task:
-            _running_tasks.pop(session_id, None)
+        event_type = event.get("type")
+        if event_type == "done":
+            payload = json.dumps({
+                "type": "done",
+                "answer": event.get("answer", ""),
+                "cancelled": False,
+            }, ensure_ascii=False)
+            yield f"data: {payload}\n\n"
+            break
+        elif event_type == "error":
+            yield f"data: {json.dumps({'type': 'error', 'error': event.get('error', '')}, ensure_ascii=False)}\n\n"
+            break
 
 
 # =============================================================================
@@ -162,76 +102,23 @@ async def _run_with_registry(session_id: str, coro):
 # =============================================================================
 @router.post("/stream")
 async def stream_query(request: QueryRequest):
-    """流式查询接口（SSE）- 推送思考步骤 + 最终回复"""
-    await _cancel_existing_task(request.session_id)
-
-    session_id = request.session_id
-    question = request.question
-    queue: asyncio.Queue = asyncio.Queue()
-
-    async def _run():
-        config = {"configurable": {"thread_id": session_id}}
-        try:
-            async for chunk in run_pqm_graph_stream(question=question, session_id=session_id):
-                await queue.put(("thinking", chunk))
-            state_snapshot = pqm_graph.get_state(config)
-            await queue.put(("done", state_snapshot.values if state_snapshot else {}))
-        except asyncio.CancelledError:
-            await queue.put(("cancelled", None))
-        except Exception as e:
-            logger.error(f"Stream error: {e}")
-            await queue.put(("error", str(e)))
-
-    task = asyncio.create_task(_run())
-    _running_tasks[session_id] = task
-
-    async def generate():
-        try:
-            while True:
-                try:
-                    event_type, data = await asyncio.wait_for(queue.get(), timeout=120.0)
-                except asyncio.TimeoutError:
-                    yield f"data: {json.dumps({'type': 'error', 'error': '请求超时'}, ensure_ascii=False)}\n\n"
-                    break
-
-                if event_type == "thinking":
-                    for node_name in data.keys():
-                        label = STEP_LABELS.get(node_name, "处理中...")
-                        payload = json.dumps({"type": "thinking", "step": node_name, "label": label}, ensure_ascii=False)
-                        yield f"data: {payload}\n\n"
-
-                elif event_type == "done":
-                    response = _build_response(data, session_id, question)
-                    done_payload = json.dumps({
-                        "type": "done",
-                        "answer": response.answer,
-                        "intent": response.intent,
-                        "sql": response.sql,
-                        "data": response.data,
-                        "count": response.count,
-                        "pdf_urls": response.pdf_urls or [],
-                        "success": response.success,
-                        "cancelled": False,
-                    }, ensure_ascii=False)
-                    yield f"data: {done_payload}\n\n"
-                    break
-
-                elif event_type == "cancelled":
-                    yield f"data: {json.dumps({'type': 'done', 'cancelled': True, 'answer': '（已停止）'}, ensure_ascii=False)}\n\n"
-                    break
-
-                elif event_type == "error":
-                    yield f"data: {json.dumps({'type': 'error', 'error': data}, ensure_ascii=False)}\n\n"
-                    break
-        finally:
-            if _running_tasks.get(session_id) is task:
-                _running_tasks.pop(session_id, None)
-            if not task.done():
-                task.cancel()
-
+    """流式查询接口（SSE）— WorkerPool + agent_loop"""
+    queue = await _submit_and_wait(request.question, request.session_id)
     increment_query_count()
     return StreamingResponse(
-        generate(),
+        _stream_from_queue(queue),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.post("/stream2")
+async def stream_query_v2(request: QueryRequest):
+    """ReAct harness SSE 流式接口 — WorkerPool + agent_loop"""
+    queue = await _submit_and_wait(request.question, request.session_id)
+    increment_query_count()
+    return StreamingResponse(
+        _stream_from_queue(queue),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -239,136 +126,72 @@ async def stream_query(request: QueryRequest):
 
 @router.post("/query", response_model=QueryResponse)
 async def query(request: QueryRequest):
-    """
-    执行自然语言查询（多 Agent 协作）
-
-    【工作流程】
-    1. Coordinator 意图识别
-    2. SQL Agent / RAG Agent 执行
-    3. Critic Agent 审查（可选）
-    4. Result Aggregation 汇总
-    """
-    # 如果同 session 有遗留任务，先取消
-    await _cancel_existing_task(request.session_id)
-
+    """同步查询接口 — WorkerPool + agent_loop"""
     try:
-        result = await _run_with_registry(
-            request.session_id,
-            run_pqm_graph(question=request.question, session_id=request.session_id),
-        )
+        queue = await _submit_and_wait(request.question, request.session_id)
+        event = await asyncio.wait_for(queue.get(), timeout=120.0)
+        answer = event.get("answer", "") if event.get("type") == "done" else ""
+        success = event.get("type") == "done"
         increment_query_count()
-        return _build_response(result, request.session_id, request.question)
-    except asyncio.CancelledError:
-        logger.info(f"Query cancelled for session {request.session_id}")
-        return _cancelled_response(request.session_id, request.question)
+        return QueryResponse(
+            success=success,
+            question=request.question,
+            session_id=request.session_id,
+            answer=answer,
+        )
+    except asyncio.TimeoutError:
+        return QueryResponse(
+            success=False,
+            question=request.question,
+            session_id=request.session_id,
+            answer="请求超时",
+        )
     except Exception as e:
-        import traceback
         logger.error(f"Agent query failed: {e}")
-        logger.debug(f"Traceback: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=str(e))
+        return QueryResponse(
+            success=False,
+            question=request.question,
+            session_id=request.session_id,
+            answer=f"查询失败: {e}",
+        )
 
 
-@router.post("/cancel/{session_id}")
-async def cancel_query(session_id: str):
-    """中断该 session 正在运行的查询。已完成的节点 state 会保留在 checkpoint 中。"""
-    task = _running_tasks.get(session_id)
-    if task is None or task.done():
-        return {"cancelled": False, "reason": "no running task"}
-    task.cancel()
-    logger.info(f"Cancel requested for session {session_id}")
-    return {"cancelled": True}
+@router.get("/sessions", response_model=List[SessionInfo])
+async def list_sessions(limit: int = 20):
+    """列出所有会话（按最近活跃倒序）"""
+    rows = await session_memory.list_sessions(limit=limit)
+    return rows
 
 
-@router.post("/resume/{session_id}", response_model=QueryResponse)
-async def resume_query(session_id: str):
-    """从最近的 checkpoint 继续上一次被中断的查询。"""
-    # 防止并发：如果还有任务在跑，先取消
-    await _cancel_existing_task(session_id)
-
-    config = {"configurable": {"thread_id": session_id}}
-
-    async def _resume():
-        # 传 None 告诉 LangGraph 从 checkpoint 继续，而不是用新 state 重置
-        return await pqm_graph.ainvoke(None, config=config)
-
-    try:
-        result = await _run_with_registry(session_id, _resume())
-    except asyncio.CancelledError:
-        logger.info(f"Resume cancelled for session {session_id}")
-        return _cancelled_response(session_id, "")
-    except Exception as e:
-        import traceback
-        logger.error(f"Resume failed: {e}")
-        logger.debug(f"Traceback: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-    question = result.get("question", "") if isinstance(result, dict) else ""
-    return _build_response(result, session_id, question)
-
-
-def _build_answer(result: Dict[str, Any]) -> str:
-    """构建最终回复文本（用于 final_response 未生成时的兜底）"""
-    sql_domain = result.get("sql", {})
-    rag_domain = result.get("rag", {})
-    sql_result = sql_domain.get("sql_result")
-    sql_error = sql_domain.get("sql_error")
-    rag_result = rag_domain.get("answer")
-
-    if sql_result and sql_result.get("success"):
-        data = sql_result.get("data", [])
-        count = sql_result.get("count", 0)
-
-        if count == 0:
-            return "没有找到符合条件的数据。"
-
-        lines = [f"找到 {count} 条结果：\n"]
-        for i, row in enumerate(data[:10], 1):
-            lines.append(f"{i}. {repr(row)}")
-
-        if count > 10:
-            lines.append(f"\n... 还有 {count - 10} 条结果未显示")
-
-        return "\n".join(lines)
-
-    if sql_error:
-        if rag_result and rag_result != "RAG 功能待完善":
-            return f"数据库查询失败：{sql_error}\n\n另外，关于您的问题：\n{rag_result}"
-        return f"抱歉，无法回答您的问题。数据库查询失败：{sql_error}"
-
-    if rag_result and rag_result != "RAG 功能待完善":
-        return rag_result
-
-    return "抱歉，无法回答您的问题。"
+@router.post("/sessions", response_model=SessionInfo)
+async def create_session(body: CreateSessionRequest):
+    """创建新会话"""
+    await session_memory.create_session(body.session_id, body.title)
+    info = await session_memory.get_session_info(body.session_id)
+    return info or {"session_id": body.session_id, "title": body.title, "turn_count": 0}
 
 
 @router.get("/history/{session_id}", response_model=HistoryResponse)
 async def get_history(session_id: str, limit: int = 10):
     """获取对话历史"""
-    history = session_memory.get_history(session_id, limit=limit * 2)
-    session_info = session_memory.get_session_info(session_id)
-    turn_count = session_info.get("turn_count", 0) if session_info else 0
-
-    return HistoryResponse(
-        session_id=session_id,
-        history=history,
-        turn_count=turn_count,
-    )
+    history = await session_memory.get_history(session_id, limit=limit * 2)
+    info = await session_memory.get_session_info(session_id)
+    turn_count = info.get("turn_count", 0) if info else 0
+    return HistoryResponse(session_id=session_id, history=history, turn_count=turn_count)
 
 
 @router.delete("/history/{session_id}")
 async def clear_history(session_id: str):
     """清除会话历史"""
-    session_memory.clear_session(session_id)
+    await session_memory.clear_session(session_id)
     return {"message": f"Session {session_id} 已清除"}
 
 
 @router.get("/health", response_model=HealthResponse)
 async def health_check():
     """检查 Agent 服务状态"""
-    from app.core import pqm_graph as _graph_module
-
+    sessions = await session_memory.list_sessions(limit=1000)
     return HealthResponse(
         status="healthy",
-        graph_ready=_graph_module is not None,
-        memory_sessions=len(session_memory.list_sessions()),
+        memory_sessions=len(sessions),
     )

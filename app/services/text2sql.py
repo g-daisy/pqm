@@ -1,34 +1,25 @@
-"""
-=============================================================================
-SQL Generation Node (agents/sql/sql_generation_node.py)
-=============================================================================
+"""Text-to-SQL service: generate → validate → execute."""
+import asyncio
+import re
+from pathlib import Path
 
-【核心功能】
-将自然语言问题转换为 SQL 查询语句。
-
-【职责】
-作为 Agent 节点，负责生成 SQL，但不执行 SQL。
-
-【工作流程】
-question → LLM 生成 SQL → 返回 generated_sql
-
-【感知/理解/执行】
-- 感知: 接收 question, session 历史
-- 理解: 结合 Schema 上下文理解查询需求
-- 执行: 调用 LLM 生成 SELECT SQL
-"""
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from app.agents.base.llm import create_chat_llm
-from app.state.state import AgentState, WorkflowStep
-from app.tools.schema_loader import schema_loader
+from app.models.llm import create_chat_llm
+from app.db.connection import fetch_all
 from app.memory.short_term_memory import session_memory
+from app.db.sql_validator import SQLValidator, SQLValidationError
+from app.db.schema_loader import schema_loader
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# 进程级 schema 缓存（schema 文件启动后不变，缓存一次即可）
+_validator = SQLValidator()
+_DOCUMENTS_DIR = Path(__file__).parent.parent.parent / "documents"
+
+# 进程级 schema 缓存
 _schema_cache: dict = {}
+
 
 def _get_schema_context() -> tuple[str, str]:
     if not _schema_cache:
@@ -37,9 +28,6 @@ def _get_schema_context() -> tuple[str, str]:
     return _schema_cache["schema"], _schema_cache["synonyms"]
 
 
-# =============================================================================
-# SQL 生成 Prompt
-# =============================================================================
 SQL_GENERATION_PROMPT = """你是热压品质异常预测系统的 SQL 生成专家。
 
 【数据库 Schema】
@@ -141,71 +129,65 @@ LIMIT 100
 """
 
 
-async def sql_generation_node(state: AgentState) -> AgentState:
-    """
-    SQL 生成 Node (Agent)
-
-    【感知】接收 question, session 历史
-    【理解】结合 Schema 上下文理解查询需求
-    【执行】调用 LLM 生成 SQL
-
-    Args:
-        state: AgentState
+async def query(question: str, session_id: str = "default") -> dict:
+    """完整 Text-to-SQL 管道：生成 SQL → 校验 → 执行 → 拼接 PDF 链接。
 
     Returns:
-        更新后的 state，包含 generated_sql
+        {"success": True, "sql": str, "data": list, "count": int, "pdf_urls": list}
+        or {"success": False, "error": str, "data": [], "count": 0}
     """
-    logger.info(f"SQL Generation 开始处理问题: {state['question'][:50]}...")
-
+    # 1. 生成 SQL
     llm = create_chat_llm()
-    question = state["question"]
-    session_id = state["session_id"]
-
-    # 获取对话历史上下文
+    schema_context, synonym_context = _get_schema_context()
     history_context = session_memory.get_context_for_llm(session_id, limit=3)
 
-    # 构建 Schema 上下文（进程级缓存）
-    schema_context, synonym_context = _get_schema_context()
-
-    # 构建 Prompt
     prompt = SQL_GENERATION_PROMPT.format(
         schema_context=schema_context,
         synonym_context=synonym_context,
     )
-
-    # 构建消息
-    messages = [
-        SystemMessage(content=prompt),
-    ]
-
+    messages = [SystemMessage(content=prompt)]
     if history_context:
-        messages.append(HumanMessage(content=f"【对话历史】\n{history_context}\n\n【用户问题】\n{question}"))
+        messages.append(HumanMessage(
+            content=f"【对话历史】\n{history_context}\n\n【用户问题】\n{question}"))
     else:
         messages.append(HumanMessage(content=f"用户问题: {question}"))
 
-    # 调用 LLM 生成 SQL
-    logger.debug("调用 LLM 生成 SQL...")
-    sql = llm.invoke(messages)
+    sql = await asyncio.to_thread(llm.invoke, messages)
     sql = sql.strip() if sql else ""
-    # 防御性剥除 LLM 可能返回的 markdown 代码块
-    import re as _re
-    sql = _re.sub(r'^```(?:sql)?\s*\n?', '', sql, flags=_re.IGNORECASE)
-    sql = _re.sub(r'\n?```\s*$', '', sql).strip()
-    logger.debug(f"生成的 SQL: {sql[:100]}...")
+    sql = re.sub(r"^```(?:sql)?\s*\n?", "", sql, flags=re.IGNORECASE)
+    sql = re.sub(r"\n?```\s*$", "", sql).strip()
 
-    # 处理无效 SQL
-    if sql == "INVALID_SQL" or not sql:
-        logger.warning("SQL 生成失败，返回 INVALID_SQL")
+    if not sql or sql == "INVALID_SQL":
+        return {"success": False, "error": "无法生成有效 SQL", "data": [], "count": 0}
+
+    # 2. 校验 SQL
+    try:
+        _validator.validate_and_sanitize(sql)
+    except SQLValidationError as e:
+        return {"success": False, "error": f"SQL 校验失败: {e}", "data": [], "count": 0}
+
+    # 3. 执行 SQL
+    try:
+        data = await fetch_all(sql)
+        if len(data) > 100:
+            data = data[:100]
+
+        seen_ids = dict.fromkeys(
+            row.get("document_id") for row in data if row.get("document_id"))
+        pdf_urls = [
+            f"documents/{doc_id}.pdf"
+            for doc_id in seen_ids
+            if (_DOCUMENTS_DIR / f"{doc_id}.pdf").exists()
+        ]
+
+        logger.info(f"text2sql: {len(data)} rows, {len(pdf_urls)} PDFs")
         return {
-            "sql": {
-                "generated_sql": None,
-                "sql_error": "无法为该问题生成有效的 SQL",
-            },
-            "current_step": WorkflowStep.SQL_GENERATION,
+            "success": True,
+            "sql": sql,
+            "data": data,
+            "count": len(data),
+            "pdf_urls": pdf_urls,
         }
-
-    logger.info(f"SQL 生成成功，长度: {len(sql)} 字符")
-    return {
-        "sql": {"generated_sql": sql},
-        "current_step": WorkflowStep.SQL_GENERATION,
-    }
+    except Exception as e:
+        logger.error(f"SQL execution failed: {e}")
+        return {"success": False, "error": str(e), "data": [], "count": 0}

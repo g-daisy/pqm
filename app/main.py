@@ -34,10 +34,31 @@ from fastapi.staticfiles import StaticFiles
 from app.core.config import settings
 from app.api import api_router
 from app.api.nap import nap_router
-from app.db.connection import init_db, close_db
+from app.db.connection import init_db, close_db, execute
 from app.utils.logger import get_logger
 
 _logger = get_logger(__name__)
+
+# ── Global singletons (shared with api/agent.py via this module) ──────────────
+from app.runtime.registry import ToolRegistry
+from app.runtime.dispatcher import ToolDispatcher
+from app.runtime.worker import WorkerPool
+from app.runtime.scheduler import Scheduler
+
+registry = ToolRegistry()
+dispatcher = ToolDispatcher(registry)
+worker_pool = WorkerPool(concurrency=4, registry=registry, dispatcher=dispatcher)
+scheduler = Scheduler(worker_pool)
+
+
+def _register_tools() -> None:
+    from app.tools.sql_tool import SqlTool
+    from app.tools.rag_tool import RagTool
+    from app.tools.schema_tool import SchemaTool
+    registry.register(SqlTool())
+    registry.register(RagTool())
+    registry.register(SchemaTool())
+    _logger.info(f"Registered tools: {registry.names()}")
 
 
 @asynccontextmanager
@@ -45,10 +66,18 @@ async def lifespan(app: FastAPI):
     """应用生命周期管理"""
     await init_db()
 
-    # 预热 LLM：触发包导入 + 建立 TCP/TLS 连接，消除首次请求冷启动延迟
+    # 建立聊天会话表（首次启动自动创建）
+    try:
+        sql = (Path(__file__).parent.parent / "scripts" / "init_chat_tables.sql").read_text()
+        await execute(sql)
+        _logger.info("Chat tables ready")
+    except Exception as e:
+        _logger.warning(f"Chat table init failed (non-fatal): {e}")
+
+    # 预热 LangChain LLM（供现有 LangGraph 节点使用）
     try:
         from langchain_core.messages import HumanMessage
-        from app.agents.base.llm import create_chat_llm
+        from app.models.llm import create_chat_llm
         _logger.info("正在预热 LLM 连接...")
         llm = create_chat_llm()
         await asyncio.to_thread(llm.invoke, [HumanMessage(content=".")])
@@ -56,7 +85,14 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         _logger.warning(f"LLM 预热失败（不影响启动）: {e}")
 
+    _register_tools()
+    await worker_pool.start()
+    await scheduler.start()
+
     yield
+
+    await scheduler.stop()
+    await worker_pool.stop()
     await close_db()
 
 

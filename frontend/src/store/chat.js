@@ -9,7 +9,6 @@ function renderMarkdown(text) {
   return marked.parse(text || '')
 }
 
-// HTML 转义（打字机动画期间安全显示纯文本）
 function escapeHtml(text) {
   return text
     .replace(/&/g, '&amp;')
@@ -18,54 +17,58 @@ function escapeHtml(text) {
     .replace(/\n/g, '<br>')
 }
 
-export const useChatStore = defineStore('chat', {
-  state: () => ({
+function initSession() {
+  return {
     messages: [],
-    sessionId: 'user-001',
     isLoading: false,
-    isTyping: false,       // 打字机动画进行中
+    isTyping: false,
     thinkingLabel: '正在思考...',
     lastCanceled: false,
     _controller: null,
     _typewriterTimer: null,
+  }
+}
+
+export const useChatStore = defineStore('chat', {
+  state: () => ({
+    _ss: {},  // { [sessionId]: SessionState }
   }),
+
   actions: {
-    _renderResponse(data) {
-      if (data.cancelled) {
-        this.messages.push({ role: 'assistant', content: '⏸ 已停止。可以「继续上次」或换一个新问题。', isCanceled: true })
-        return
+    // Returns or lazily initialises the session state object.
+    _s(sid) {
+      if (!this._ss[sid]) {
+        this._ss[sid] = initSession()
       }
-      if (data.error) {
-        this.messages.push({ role: 'assistant', content: `❌ 错误: ${data.error}`, isError: true })
-        return
-      }
-      let answer = renderMarkdown(data.answer || '')
-      if (data.pdf_urls && data.pdf_urls.length > 0) {
-        const pdfs = data.pdf_urls.map(url =>
-          `<a href="/${url}" target="_blank">📥 ${url}</a>`
-        ).join('')
-        answer += `<div class="pdf-links">📄 相关文档: ${pdfs}</div>`
-      }
-      this.messages.push({ role: 'assistant', content: answer })
+      return this._ss[sid]
     },
 
-    _startTypewriter(msgIndex, rawText, pdfUrls) {
-      const BATCH = 4       // 每帧显示字符数
-      const INTERVAL = 16   // ms（≈60fps），约 250 字/秒
+    // Inject history loaded from DB into a session (called by switchSession on first load).
+    loadMessages(sid, messages) {
+      const s = this._s(sid)
+      s.messages = messages.map(m => ({
+        role: m.role,
+        content: m.role === 'assistant' ? renderMarkdown(m.content) : m.content,
+      }))
+    },
 
-      this.isTyping = true
+    _startTypewriter(sid, msgIndex, rawText, pdfUrls) {
+      const BATCH = 4
+      const INTERVAL = 16
+
+      const s = this._s(sid)
+      s.isTyping = true
       let charIndex = 0
 
-      this._typewriterTimer = setInterval(() => {
+      s._typewriterTimer = setInterval(() => {
         charIndex = Math.min(charIndex + BATCH, rawText.length)
         const slice = rawText.slice(0, charIndex)
-        this.messages[msgIndex].content = escapeHtml(slice)
+        s.messages[msgIndex].content = escapeHtml(slice)
 
         if (charIndex >= rawText.length) {
-          clearInterval(this._typewriterTimer)
-          this._typewriterTimer = null
+          clearInterval(s._typewriterTimer)
+          s._typewriterTimer = null
 
-          // 动画结束后渲染完整 Markdown
           let finalContent = renderMarkdown(rawText)
           if (pdfUrls && pdfUrls.length > 0) {
             const pdfs = pdfUrls.map(url =>
@@ -73,115 +76,122 @@ export const useChatStore = defineStore('chat', {
             ).join('')
             finalContent += `<div class="pdf-links">📄 相关文档: ${pdfs}</div>`
           }
-          this.messages[msgIndex].content = finalContent
-          this.isTyping = false
+          s.messages[msgIndex].content = finalContent
+          s.isTyping = false
         }
       }, INTERVAL)
     },
 
-    async sendMessage(question) {
-      if (this.isLoading || this.isTyping) return
-      this.isLoading = true
-      this.lastCanceled = false
-      this.thinkingLabel = '正在思考...'
-      this.messages.push({ role: 'user', content: question })
+    async sendMessage(question, sid) {
+      const s = this._s(sid)
+      if (s.isLoading || s.isTyping) return
+
+      s.isLoading = true
+      s.lastCanceled = false
+      s.thinkingLabel = '正在思考...'
+      s.messages.push({ role: 'user', content: question })
 
       const controller = new AbortController()
-      this._controller = controller
+      s._controller = controller
 
       try {
         await chatApi.queryStream(
           question,
-          this.sessionId,
+          sid,
           // onThinking
           (event) => {
-            this.thinkingLabel = event.label
+            s.thinkingLabel = event.label
           },
           // onDone
           (event) => {
-            this.isLoading = false
-            this._controller = null
+            s.isLoading = false
+            s._controller = null
 
             if (event.cancelled) {
-              this.messages.push({ role: 'assistant', content: '⏸ 已停止。可以「继续上次」或换一个新问题。', isCanceled: true })
-              this.lastCanceled = true
+              s.messages.push({ role: 'assistant', content: '⏸ 已停止。可以「继续上次」或换一个新问题。', isCanceled: true })
+              s.lastCanceled = true
               return
             }
 
             const rawText = event.answer || ''
             const pdfUrls = event.pdf_urls || []
-
-            // 先插入空消息占位，打字机逐步填充
-            const msgIndex = this.messages.length
-            this.messages.push({ role: 'assistant', content: '' })
-            this._startTypewriter(msgIndex, rawText, pdfUrls)
+            const msgIndex = s.messages.length
+            s.messages.push({ role: 'assistant', content: '' })
+            this._startTypewriter(sid, msgIndex, rawText, pdfUrls)
           },
           // onError
           (error) => {
-            this.isLoading = false
-            this._controller = null
-            this.messages.push({ role: 'assistant', content: `❌ 请求失败: ${error}`, isError: true })
+            s.isLoading = false
+            s._controller = null
+            s.messages.push({ role: 'assistant', content: `❌ 请求失败: ${error}`, isError: true })
           },
           controller.signal,
         )
       } catch (error) {
-        this.isLoading = false
-        this._controller = null
+        s.isLoading = false
+        s._controller = null
         if (error.name === 'AbortError') {
-          this.messages.push({ role: 'assistant', content: '⏸ 已停止。可以「继续上次」或换一个新问题。', isCanceled: true })
-          this.lastCanceled = true
+          s.messages.push({ role: 'assistant', content: '⏸ 已停止。可以「继续上次」或换一个新问题。', isCanceled: true })
+          s.lastCanceled = true
         } else {
-          this.messages.push({ role: 'assistant', content: `❌ 请求失败: ${error.message}`, isError: true })
+          s.messages.push({ role: 'assistant', content: `❌ 请求失败: ${error.message}`, isError: true })
         }
       }
     },
 
-    async cancelCurrent() {
-      if (!this.isLoading) return
+    async cancelCurrent(sid) {
+      const s = this._s(sid)
+      if (!s.isLoading) return
       try {
-        await chatApi.cancel(this.sessionId)
+        await chatApi.cancel(sid)
       } catch (e) {}
-      if (this._controller) {
-        this._controller.abort()
+      if (s._controller) {
+        s._controller.abort()
       }
     },
 
-    async resumeLast() {
-      if (this.isLoading) return
-      this.isLoading = true
-      this.lastCanceled = false
-      this.thinkingLabel = '正在恢复上次查询...'
+    async resumeLast(sid) {
+      const s = this._s(sid)
+      if (s.isLoading) return
+      s.isLoading = true
+      s.lastCanceled = false
+      s.thinkingLabel = '正在恢复上次查询...'
 
       const controller = new AbortController()
-      this._controller = controller
+      s._controller = controller
 
       try {
-        const response = await chatApi.resume(this.sessionId, controller.signal)
-        this._renderResponse(response.data)
-        if (response.data.cancelled) {
-          this.lastCanceled = true
+        const response = await chatApi.resume(sid, controller.signal)
+        const data = response.data
+        if (data.cancelled) {
+          s.messages.push({ role: 'assistant', content: '⏸ 已停止。可以「继续上次」或换一个新问题。', isCanceled: true })
+          s.lastCanceled = true
+        } else if (data.error) {
+          s.messages.push({ role: 'assistant', content: `❌ 错误: ${data.error}`, isError: true })
+        } else {
+          s.messages.push({ role: 'assistant', content: renderMarkdown(data.answer || '') })
         }
       } catch (error) {
         if (axios.isCancel(error) || error.name === 'CanceledError') {
-          this.messages.push({ role: 'assistant', content: '⏸ 已停止。可以「继续上次」或换一个新问题。', isCanceled: true })
-          this.lastCanceled = true
+          s.messages.push({ role: 'assistant', content: '⏸ 已停止。可以「继续上次」或换一个新问题。', isCanceled: true })
+          s.lastCanceled = true
         } else {
-          this.messages.push({ role: 'assistant', content: `❌ 继续失败: ${error.message}`, isError: true })
+          s.messages.push({ role: 'assistant', content: `❌ 继续失败: ${error.message}`, isError: true })
         }
       } finally {
-        this.isLoading = false
-        this._controller = null
+        s.isLoading = false
+        s._controller = null
       }
     },
 
-    clearChat() {
-      if (this._typewriterTimer) {
-        clearInterval(this._typewriterTimer)
-        this._typewriterTimer = null
+    // Clear a session's in-memory state (also called on delete).
+    clearSession(sid) {
+      const s = this._ss[sid]
+      if (!s) return
+      if (s._typewriterTimer) {
+        clearInterval(s._typewriterTimer)
       }
-      this.messages = []
-      this.lastCanceled = false
-      this.isTyping = false
-    }
-  }
+      delete this._ss[sid]
+    },
+  },
 })

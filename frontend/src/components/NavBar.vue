@@ -1,6 +1,9 @@
 <template>
   <div class="nav">
-    <h1>🔥 热压品质异常预测系统</h1>
+    <h1 style="display:flex;align-items:center;gap:10px">
+      <img src="/logo.png" alt="logo" style="height:36px">
+      品质异常分析系统
+    </h1>
     <div class="nav-links">
       <router-link to="/chat">💬 对话</router-link>
       <template v-if="auth.isAdmin">

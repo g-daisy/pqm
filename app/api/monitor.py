@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 from app.memory.short_term_memory import session_memory
-from app.tools.ragflow_client import get_ragflow_client
+from app.knowledge.ragflow_client import get_ragflow_client
 
 router = APIRouter(prefix="/monitor", tags=["Monitor"])
 

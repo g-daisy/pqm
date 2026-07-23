@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from app.tools.ragflow_client import get_ragflow_client
+from app.knowledge.ragflow_client import get_ragflow_client
 
 router = APIRouter(prefix="/documents", tags=["Documents"])
 

@@ -5,7 +5,7 @@
     <div class="container">
       <div class="card">
         <h2>📚 知识库管理</h2>
-        <p style="color:#666;margin-bottom:20px">查看和管理热压品质异常预测系统的文档</p>
+        <p style="color:#666;margin-bottom:20px">查看和管理品质异常分析系统的文档</p>
 
         <div style="margin-bottom:20px">
           <input v-model="searchQuery" placeholder="搜索文档..." style="padding:10px 14px;border:1px solid #ddd;border-radius:6px;width:300px">
