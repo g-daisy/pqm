@@ -1,4 +1,5 @@
 """ReAct while-True harness: the core agent loop."""
+import json
 import os
 from app.models.llm import get_minimax_client
 from app.runtime.registry import ToolRegistry
@@ -52,6 +53,19 @@ async def agent_loop(messages: list, registry: ToolRegistry,
 
         logger.info(f"agent_loop: dispatching {len(msg.tool_calls)} tool call(s)")
         await dispatcher.dispatch(msg.tool_calls, messages)
+
+        # Short-circuit: search_knowledge_base already synthesised a complete answer
+        if (len(msg.tool_calls) == 1 and
+                msg.tool_calls[0].function.name == "search_knowledge_base"):
+            try:
+                tool_content = json.loads(messages[-1]["content"])
+                answer = tool_content.get("answer", "")
+                if answer and not answer.startswith("RAG 检索失败") and answer != "未找到相关文档":
+                    messages.append({"role": "assistant", "content": answer, "tool_calls": []})
+                    logger.info("agent_loop: RAG answer used directly (skipped final LLM call)")
+                    return
+            except Exception:
+                pass
 
         used_todo = any(tc.function.name == "todo_write"
                         for tc in (msg.tool_calls or []))
