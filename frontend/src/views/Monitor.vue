@@ -7,7 +7,7 @@
         <h2>📊 系统监控</h2>
         <p style="color:#666;margin-bottom:20px">查看系统运行状态和性能指标</p>
 
-        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:20px;margin-bottom:30px">
+        <div class="stats-grid">
           <div style="background:#f8f8f8;padding:20px;border-radius:8px;text-align:center">
             <div style="font-size:32px;color:#667eea;font-weight:bold">{{ stats.queries || 0 }}</div>
             <div style="color:#666;font-size:13px">总查询数</div>
@@ -63,3 +63,15 @@ onMounted(async () => {
   }
 })
 </script>
+
+<style scoped>
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 20px;
+  margin-bottom: 30px;
+}
+@media (max-width: 768px) {
+  .stats-grid { grid-template-columns: 1fr; gap: 12px; }
+}
+</style>

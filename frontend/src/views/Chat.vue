@@ -3,13 +3,15 @@
     <NavBar />
 
     <!-- 双列布局：左边栏 + 右侧聊天区 -->
-    <div style="display:flex;height:calc(100vh - 60px);background:#f5f7fa;overflow:hidden">
+    <div class="chat-layout">
+
+      <!-- 移动端遮罩层 -->
+      <div v-if="sidebarOpen" class="sidebar-backdrop" @click="sidebarOpen = false"></div>
 
       <!-- 左侧边栏 -->
-      <div style="width:220px;min-width:180px;border-right:1px solid #e5e7eb;
-                  background:#fff;display:flex;flex-direction:column;overflow:hidden;flex-shrink:0">
+      <div class="chat-sidebar" :class="{ 'sidebar-open': sidebarOpen }">
         <!-- 新建对话 -->
-        <div style="padding:12px;border-bottom:1px solid #f3f4f6">
+        <div style="padding:12px;border-bottom:1px solid #f3f4f6;flex-shrink:0">
           <button
             @click="createSession"
             style="width:100%;padding:8px 0;background:#4f46e5;color:#fff;border:none;
@@ -72,7 +74,15 @@
       </div>
 
       <!-- 右侧聊天区域 -->
-      <div style="flex:1;display:flex;flex-direction:column;overflow:hidden;min-width:0">
+      <div class="chat-main">
+
+        <!-- 移动端顶部栏（仅移动端显示） -->
+        <div class="mobile-header">
+          <button class="sidebar-toggle" @click="sidebarOpen = !sidebarOpen">☰</button>
+          <span class="mobile-session-title">
+            {{ sessions.find(s => s.session_id === sessionId)?.title || '新对话' }}
+          </span>
+        </div>
 
         <!-- 已收录客户（折叠式） -->
         <div v-if="customers.length"
@@ -242,6 +252,7 @@ const chatBox     = ref(null)
 const customers   = ref([])
 const sessions    = ref([])
 const openMenuId  = ref(null)
+const sidebarOpen = ref(false)
 
 // 客户零件面板
 const activeCustomer = ref(null)
@@ -280,12 +291,14 @@ async function createSession() {
     })
   } catch (_) {}
   sessionId.value = id
+  sidebarOpen.value = false
   await loadSessions()
 }
 
 async function switchSession(id) {
-  if (id === sessionId.value) return
+  if (id === sessionId.value) { sidebarOpen.value = false; return }
   openMenuId.value = null
+  sidebarOpen.value = false
   sessionId.value = id
   if (!chatStore._ss[id]) {
     try {
@@ -359,6 +372,7 @@ async function deleteSip(documentId, partName) {
 
 async function deleteSession(id) {
   openMenuId.value = null
+  sidebarOpen.value = false
   try {
     await fetch(`/api/v1/agent/history/${id}`, { method: 'DELETE' })
   } catch (_) {}
@@ -402,3 +416,102 @@ async function resumeLast() {
   await chatStore.resumeLast(sessionId.value)
 }
 </script>
+
+<style scoped>
+/* ===== 双列布局容器 ===== */
+.chat-layout {
+  display: flex;
+  height: calc(100vh - 60px);
+  background: #f5f7fa;
+  overflow: hidden;
+  position: relative;
+}
+
+/* ===== 左侧边栏 ===== */
+.chat-sidebar {
+  width: 220px;
+  min-width: 180px;
+  border-right: 1px solid #e5e7eb;
+  background: #fff;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+/* ===== 右侧聊天区 ===== */
+.chat-main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-width: 0;
+}
+
+/* ===== 移动端元素（桌面隐藏） ===== */
+.sidebar-backdrop { display: none; }
+.mobile-header    { display: none; }
+
+/* ===== 移动端 (≤768px) ===== */
+@media (max-width: 768px) {
+  /* 侧边栏：收起时滑出屏幕左侧 */
+  .chat-sidebar {
+    position: fixed;
+    left: 0;
+    top: 60px;
+    bottom: 0;
+    width: 80%;
+    max-width: 280px;
+    z-index: 200;
+    transform: translateX(-100%);
+    transition: transform 0.25s ease;
+    min-width: unset;
+  }
+  /* 侧边栏：展开时滑入 */
+  .chat-sidebar.sidebar-open {
+    transform: translateX(0);
+    box-shadow: 4px 0 24px rgba(0, 0, 0, 0.18);
+  }
+
+  /* 遮罩层 */
+  .sidebar-backdrop {
+    display: block;
+    position: fixed;
+    inset: 0;
+    top: 60px;
+    background: rgba(0, 0, 0, 0.4);
+    z-index: 199;
+  }
+
+  /* 移动端顶部栏 */
+  .mobile-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 12px;
+    background: #fff;
+    border-bottom: 1px solid #e5e7eb;
+    flex-shrink: 0;
+  }
+  .sidebar-toggle {
+    background: transparent;
+    border: none;
+    font-size: 20px;
+    cursor: pointer;
+    color: #4f46e5;
+    padding: 4px 6px;
+    border-radius: 6px;
+    line-height: 1;
+    flex-shrink: 0;
+  }
+  .sidebar-toggle:hover { background: #eef2ff; }
+  .mobile-session-title {
+    font-size: 14px;
+    font-weight: 500;
+    color: #374151;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+}
+</style>

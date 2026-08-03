@@ -236,3 +236,14 @@ body {
 }
 
 .btn-danger:hover { background: #ee5a5a; }
+
+/* ===== 移动端响应式 (< 768px) ===== */
+@media (max-width: 768px) {
+  .container { margin: 16px auto; padding: 0 12px; }
+  .card { padding: 16px; }
+  .input-box { padding: 10px 12px; gap: 8px; }
+  .input-box input { font-size: 14px; padding: 12px 14px; }
+  .input-box button { padding: 12px 16px; font-size: 14px; }
+  .message-content { max-width: 90%; }
+  .session-info input { width: 100%; }
+}
