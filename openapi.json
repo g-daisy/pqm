@@ -1,0 +1,861 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "热压品质异常预测系统 (PQM Agent)",
+    "version": "1.0.0",
+    "description": "SIP 检验数据查询 Agent，支持自然语言 Text2SQL 和 RAG 知识库检索"
+  },
+  "servers": [
+    { "url": "http://localhost:8000", "description": "本地开发/容器直连（后端 8000 端口）" }
+  ],
+  "paths": {
+    "/": {
+      "get": {
+        "operationId": "root",
+        "summary": "根路径 — 返回系统名称和版本",
+        "tags": ["健康检查"],
+        "responses": {
+          "200": {
+            "description": "系统信息",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/RootResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "operationId": "health_check",
+        "summary": "全局健康检查 — NAP 协议要求 status 必须为 ok",
+        "tags": ["健康检查"],
+        "responses": {
+          "200": {
+            "description": "健康状态",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/HealthStatus" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/meta": {
+      "get": {
+        "operationId": "nap_meta",
+        "summary": "NAP Agent 元数据 — 平台 Sync 时调用，返回能力描述",
+        "tags": ["NAP"],
+        "responses": {
+          "200": {
+            "description": "Agent 元信息",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/NAPMeta" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/stream": {
+      "post": {
+        "operationId": "nap_stream",
+        "summary": "NAP 流式聊天 — SSE 格式，event: message/done/error",
+        "description": "NoDeskClaw Agent Protocol v1.0 标准流式接口，从 messages 列表中取最后一条 role=user 的内容作为提问",
+        "tags": ["NAP"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/NAPStreamRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "SSE 事件流；事件类型：message（内容分块）、done（完成）、error（错误）",
+            "content": { "text/event-stream": { "schema": { "type": "string" } } }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/login": {
+      "post": {
+        "operationId": "auth_login",
+        "summary": "管理员登录，返回 JWT access_token（有效期 480 分钟）",
+        "tags": ["Auth"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/LoginRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "登录成功，返回 JWT",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/LoginResponse" }
+              }
+            }
+          },
+          "401": { "description": "用户名或密码错误" }
+        }
+      }
+    },
+    "/api/v1/agent/stream": {
+      "post": {
+        "operationId": "agent_stream",
+        "summary": "流式问答（SSE） — WorkerPool + agent_loop，data 字段含 type: done/error",
+        "tags": ["Agent"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/QueryRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "SSE 流；完整答案在 done 事件的 answer 字段",
+            "content": { "text/event-stream": { "schema": { "type": "string" } } }
+          }
+        }
+      }
+    },
+    "/api/v1/agent/stream2": {
+      "post": {
+        "operationId": "agent_stream2",
+        "summary": "ReAct harness 流式问答（SSE） — 与 /agent/stream 行为相同，备用入口",
+        "tags": ["Agent"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/QueryRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "SSE 流",
+            "content": { "text/event-stream": { "schema": { "type": "string" } } }
+          }
+        }
+      }
+    },
+    "/api/v1/agent/query": {
+      "post": {
+        "operationId": "agent_query",
+        "summary": "同步问答 — 阻塞等待完整答案后返回，超时 120 秒",
+        "tags": ["Agent"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/QueryRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "问答结果",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/QueryResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/agent/sessions": {
+      "get": {
+        "operationId": "list_sessions",
+        "summary": "列出所有会话，按最近活跃时间倒序",
+        "tags": ["Agent"],
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "返回会话数上限",
+            "schema": { "type": "integer", "default": 20 }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "会话列表",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": { "$ref": "#/components/schemas/SessionInfo" }
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "operationId": "create_session",
+        "summary": "创建新会话，session_id 须全局唯一",
+        "tags": ["Agent"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CreateSessionRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "新建会话信息",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/SessionInfo" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/agent/history/{session_id}": {
+      "get": {
+        "operationId": "get_history",
+        "summary": "获取指定会话的对话历史",
+        "tags": ["Agent"],
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "description": "会话 ID，如 default 或自定义字符串",
+            "schema": { "type": "string", "example": "default" }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "返回对话轮次上限（实际取 limit*2 条消息）",
+            "schema": { "type": "integer", "default": 10 }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "历史记录",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/HistoryResponse" }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "operationId": "clear_history",
+        "summary": "清除指定会话的全部历史记录",
+        "tags": ["Agent"],
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "description": "会话 ID",
+            "schema": { "type": "string", "example": "default" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "清除成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "message": { "type": "string", "description": "操作结果说明" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/agent/health": {
+      "get": {
+        "operationId": "agent_health",
+        "summary": "Agent 服务健康检查，返回当前活跃会话总数",
+        "tags": ["Agent"],
+        "responses": {
+          "200": {
+            "description": "Agent 健康状态",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AgentHealth" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/documents": {
+      "get": {
+        "operationId": "list_documents",
+        "summary": "列出 RagFlow 知识库中的文档（最多 100 条）",
+        "tags": ["Documents"],
+        "responses": {
+          "200": {
+            "description": "文档列表",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/DocumentsResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/monitor/stats": {
+      "get": {
+        "operationId": "get_stats",
+        "summary": "系统统计 — 返回累计查询数、活跃会话数、知识库文档数",
+        "tags": ["Monitor"],
+        "responses": {
+          "200": {
+            "description": "统计数据",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/StatsResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/monitor/recent": {
+      "get": {
+        "operationId": "get_recent",
+        "summary": "最近用户提问记录（最多 20 条，按时间倒序）",
+        "tags": ["Monitor"],
+        "responses": {
+          "200": {
+            "description": "最近提问列表",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": { "$ref": "#/components/schemas/RecentQuery" }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/upload/excel": {
+      "post": {
+        "operationId": "upload_excel",
+        "summary": "批量上传 SIP Excel，将检验项写入 sip_records 表（UPSERT）",
+        "description": "Excel 须含 12 列，按顺序：项目号/客户/文件号/零件号/零件名称/工序/模具号/检验项/规范或描述/检验方法/检查频次/版本号；第1行为表头，从第2行开始读取",
+        "tags": ["Upload"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "file": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "SIP 检验表 Excel 文件（.xlsx / .xls）"
+                  }
+                },
+                "required": ["file"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "导入结果统计",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ExcelUploadResponse" }
+              }
+            }
+          },
+          "400": { "description": "文件格式不支持或 Excel 解析失败" }
+        }
+      }
+    },
+    "/api/v1/upload/pdf": {
+      "post": {
+        "operationId": "upload_pdf",
+        "summary": "上传 SIP PDF，自动或手动提取文件号后保存到 documents/ 目录",
+        "description": "优先使用 document_id 参数；未提供时自动从 PDF 文本提取文件号。若自动提取失败，返回 422 并附带文本片段，供前端引导用户手动填写",
+        "tags": ["Upload"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "file": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "SIP 文件 PDF（.pdf），系统将自动识别文件号"
+                  },
+                  "document_id": {
+                    "type": "string",
+                    "description": "手动指定文件号（可选），格式：大写字母开头，含字母/数字/连字符，如 HP-SIP-001",
+                    "example": "HP-SIP-001"
+                  }
+                },
+                "required": ["file"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "上传成功",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/PdfUploadResponse" }
+              }
+            }
+          },
+          "400": { "description": "文件格式不支持或 PDF 解析失败" },
+          "422": { "description": "无法自动识别文件号，响应体含 snippet 供用户参考" }
+        }
+      }
+    },
+    "/api/v1/upload/customers": {
+      "get": {
+        "operationId": "get_customers",
+        "summary": "查询所有客户及其 SIP 统计（文件数、零件数、检验记录总行数）",
+        "tags": ["Upload"],
+        "responses": {
+          "200": {
+            "description": "客户列表",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/CustomersResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/upload/customers/{customer}/parts": {
+      "get": {
+        "operationId": "get_customer_parts",
+        "summary": "查询指定客户下所有零件的 SIP 文件列表，含 PDF 存在状态",
+        "tags": ["Upload"],
+        "parameters": [
+          {
+            "name": "customer",
+            "in": "path",
+            "required": true,
+            "description": "客户名称，与 sip_records.customer 字段值精确匹配",
+            "schema": { "type": "string", "example": "某汽车" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "零件及 SIP 文件列表",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/CustomerPartsResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/upload/prompt-hints": {
+      "get": {
+        "operationId": "get_prompt_hints",
+        "summary": "从 sip_records 抽取代表性记录，供前端生成具体的提示词（最多 12 条）",
+        "tags": ["Upload"],
+        "responses": {
+          "200": {
+            "description": "提示词素材列表",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/PromptHintsResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/upload/sip/{document_id}": {
+      "delete": {
+        "operationId": "delete_sip",
+        "summary": "删除指定文件号的全部 sip_records 行及对应 PDF 文件（需管理员 JWT）",
+        "tags": ["Upload"],
+        "security": [{ "BearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "document_id",
+            "in": "path",
+            "required": true,
+            "description": "要删除的文件号，与 sip_records.document_id 精确匹配，如 HP-SIP-001",
+            "schema": { "type": "string", "example": "HP-SIP-001" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "删除结果",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/DeleteSipResponse" }
+              }
+            }
+          },
+          "401": { "description": "未提供 Bearer token 或 token 无效" },
+          "404": { "description": "文件号不存在" }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "RootResponse": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string", "description": "系统名称" },
+          "version": { "type": "string", "description": "版本号" },
+          "status": { "type": "string", "description": "运行状态，固定为 running" }
+        }
+      },
+      "HealthStatus": {
+        "type": "object",
+        "properties": {
+          "status": { "type": "string", "description": "固定为 ok" },
+          "timestamp": { "type": "integer", "description": "Unix 时间戳（秒）" }
+        }
+      },
+      "NAPMeta": {
+        "type": "object",
+        "properties": {
+          "protocol_version": { "type": "string", "description": "NAP 协议版本" },
+          "agent_id": { "type": "string", "description": "Agent 唯一标识" },
+          "name": { "type": "string", "description": "Agent 名称" },
+          "description": { "type": "string", "description": "Agent 功能描述" },
+          "version": { "type": "string", "description": "Agent 版本" },
+          "runtime": { "type": "string", "description": "运行时类型" },
+          "capabilities": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "能力标签列表，如 SIP检验数据查询、Text2SQL"
+          }
+        }
+      },
+      "NAPMessage": {
+        "type": "object",
+        "properties": {
+          "role": {
+            "type": "string",
+            "description": "消息角色",
+            "enum": ["user", "assistant"],
+            "example": "user"
+          },
+          "content": {
+            "type": "string",
+            "description": "消息正文",
+            "example": "查询 HP 零件外观检验项的规范"
+          }
+        },
+        "required": ["role", "content"]
+      },
+      "NAPStreamRequest": {
+        "type": "object",
+        "properties": {
+          "protocol_version": {
+            "type": "string",
+            "description": "NAP 协议版本",
+            "default": "1.0"
+          },
+          "request_id": {
+            "type": "string",
+            "description": "请求唯一 ID，由调用方生成，建议使用 UUID",
+            "example": "req-abc123"
+          },
+          "session_id": {
+            "type": "string",
+            "description": "会话 ID，用于关联多轮上下文",
+            "example": "session-001"
+          },
+          "user_id": {
+            "type": "string",
+            "description": "发起用户 ID",
+            "example": "user-001"
+          },
+          "organization_id": {
+            "type": "string",
+            "description": "组织 ID（可选）"
+          },
+          "messages": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/NAPMessage" },
+            "description": "消息列表；系统取最后一条 role=user 的内容作为本轮提问"
+          },
+          "metadata": {
+            "type": "object",
+            "description": "扩展元数据（可选），JSON 对象输入"
+          }
+        },
+        "required": ["request_id", "session_id", "user_id", "messages"]
+      },
+      "LoginRequest": {
+        "type": "object",
+        "properties": {
+          "username": {
+            "type": "string",
+            "description": "管理员用户名（见 .env ADMIN_USERNAME）",
+            "example": "admin"
+          },
+          "password": {
+            "type": "string",
+            "description": "管理员密码（见 .env ADMIN_PASSWORD）"
+          }
+        },
+        "required": ["username", "password"]
+      },
+      "LoginResponse": {
+        "type": "object",
+        "properties": {
+          "access_token": {
+            "type": "string",
+            "description": "JWT 令牌，有效期 480 分钟；后续需管理员权限的接口须在 Authorization 头携带"
+          },
+          "token_type": {
+            "type": "string",
+            "description": "固定为 bearer"
+          }
+        }
+      },
+      "QueryRequest": {
+        "type": "object",
+        "properties": {
+          "question": {
+            "type": "string",
+            "description": "用户自然语言问题",
+            "example": "查询 HP 零件外观检验项的规范"
+          },
+          "session_id": {
+            "type": "string",
+            "description": "会话 ID，用于关联多轮上下文；填 default 使用默认会话",
+            "default": "default",
+            "example": "session-001"
+          },
+          "mode": {
+            "type": "string",
+            "description": "查询模式，当前仅支持 auto",
+            "default": "auto"
+          }
+        },
+        "required": ["question"]
+      },
+      "QueryResponse": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean", "description": "是否成功返回答案" },
+          "question": { "type": "string", "description": "原始问题" },
+          "session_id": { "type": "string", "description": "会话 ID" },
+          "answer": { "type": "string", "description": "答案文本；失败时为错误描述" },
+          "cancelled": { "type": "boolean", "description": "是否被取消（当前固定为 false）" }
+        }
+      },
+      "SessionInfo": {
+        "type": "object",
+        "properties": {
+          "session_id": { "type": "string", "description": "会话 ID" },
+          "title": { "type": "string", "description": "会话标题（可为空）" },
+          "turn_count": { "type": "integer", "description": "累计对话轮次", "default": 0 },
+          "last_active": { "type": "string", "description": "最近活跃时间（ISO-8601 格式）" }
+        }
+      },
+      "CreateSessionRequest": {
+        "type": "object",
+        "properties": {
+          "session_id": {
+            "type": "string",
+            "description": "会话 ID，须全局唯一",
+            "example": "session-001"
+          },
+          "title": {
+            "type": "string",
+            "description": "会话标题（可为空）",
+            "default": ""
+          }
+        },
+        "required": ["session_id"]
+      },
+      "HistoryResponse": {
+        "type": "object",
+        "properties": {
+          "session_id": { "type": "string", "description": "会话 ID" },
+          "history": {
+            "type": "array",
+            "items": { "type": "object" },
+            "description": "消息记录列表，每条含 role / content / timestamp，JSON 数组输入"
+          },
+          "turn_count": { "type": "integer", "description": "会话累计轮次" }
+        }
+      },
+      "AgentHealth": {
+        "type": "object",
+        "properties": {
+          "status": { "type": "string", "description": "固定为 healthy" },
+          "memory_sessions": { "type": "integer", "description": "当前持久化会话总数" }
+        }
+      },
+      "DocumentsResponse": {
+        "type": "object",
+        "properties": {
+          "documents": {
+            "type": "array",
+            "items": { "type": "object" },
+            "description": "RagFlow 文档对象列表，JSON 数组"
+          },
+          "total": { "type": "integer", "description": "文档总数" },
+          "error": { "type": "string", "description": "获取失败时的错误信息（可选字段）" }
+        }
+      },
+      "StatsResponse": {
+        "type": "object",
+        "properties": {
+          "queries": { "type": "integer", "description": "进程启动以来的累计查询次数" },
+          "sessions": { "type": "integer", "description": "当前活跃会话数" },
+          "documents": { "type": "integer", "description": "RagFlow 知识库文档总数" }
+        }
+      },
+      "RecentQuery": {
+        "type": "object",
+        "properties": {
+          "session": { "type": "string", "description": "会话 ID" },
+          "question": { "type": "string", "description": "用户提问内容" },
+          "time": { "type": "string", "description": "提问时间，格式 YYYY-MM-DD HH:mm" }
+        }
+      },
+      "ExcelUploadResponse": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean" },
+          "inserted": { "type": "integer", "description": "新增行数" },
+          "updated": { "type": "integer", "description": "更新行数（已存在则覆盖）" },
+          "skipped": { "type": "integer", "description": "跳过行数（空行或缺少必填字段）" },
+          "errors": { "type": "integer", "description": "数据库写入失败行数" },
+          "error_details": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "失败详情列表（最多 20 条）"
+          }
+        }
+      },
+      "PdfUploadResponse": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean" },
+          "document_id": { "type": "string", "description": "最终使用的文件号（大写）" },
+          "filename": { "type": "string", "description": "保存的文件名，格式 {document_id}.pdf" },
+          "overwritten": { "type": "boolean", "description": "是否覆盖了已有 PDF 文件" },
+          "extracted_by": {
+            "type": "string",
+            "description": "文件号来源",
+            "enum": ["manual", "auto"]
+          }
+        }
+      },
+      "CustomerStat": {
+        "type": "object",
+        "properties": {
+          "customer": { "type": "string", "description": "客户名称" },
+          "doc_count": { "type": "integer", "description": "该客户下 SIP 文件数" },
+          "part_count": { "type": "integer", "description": "该客户下零件数" },
+          "record_count": { "type": "integer", "description": "该客户下检验记录总行数" }
+        }
+      },
+      "CustomersResponse": {
+        "type": "object",
+        "properties": {
+          "customers": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/CustomerStat" },
+            "description": "客户统计列表，按客户名称排序"
+          }
+        }
+      },
+      "PartInfo": {
+        "type": "object",
+        "properties": {
+          "part_name": { "type": "string", "description": "零件名称" },
+          "part_num": { "type": "string", "description": "零件号" },
+          "document_id": { "type": "string", "description": "SIP 文件号" },
+          "version": { "type": "string", "description": "最新版本号" },
+          "pdf_exists": { "type": "boolean", "description": "PDF 是否已上传到 documents/ 目录" },
+          "pdf_url": { "type": "string", "description": "PDF 访问路径（documents/{document_id}.pdf），未上传时为 null" }
+        }
+      },
+      "CustomerPartsResponse": {
+        "type": "object",
+        "properties": {
+          "customer": { "type": "string", "description": "客户名称" },
+          "parts": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/PartInfo" }
+          }
+        }
+      },
+      "PromptHint": {
+        "type": "object",
+        "properties": {
+          "customer": { "type": "string", "description": "客户名称" },
+          "part_name": { "type": "string", "description": "零件名称" },
+          "process": { "type": "string", "description": "工序" },
+          "inspection_item": { "type": "string", "description": "检验项名称" }
+        }
+      },
+      "PromptHintsResponse": {
+        "type": "object",
+        "properties": {
+          "hints": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/PromptHint" },
+            "description": "代表性检验项列表，按客户+零件+检验项去重，最多 12 条"
+          }
+        }
+      },
+      "DeleteSipResponse": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean" },
+          "document_id": { "type": "string", "description": "被删除的文件号" },
+          "records_deleted": { "type": "integer", "description": "删除的 sip_records 行数" },
+          "pdf_deleted": { "type": "boolean", "description": "是否同时删除了对应 PDF 文件" }
+        }
+      }
+    },
+    "securitySchemes": {
+      "BearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "description": "先调用 POST /api/v1/auth/login 获取 JWT，在此处粘贴 access_token 值（不含 Bearer 前缀）"
+      }
+    }
+  }
+}

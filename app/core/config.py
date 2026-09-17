@@ -50,6 +50,10 @@ class Settings(BaseSettings):
     RAGFLOW_API_KEY: str = ""
     RAGFLOW_DATASET_ID: str = ""
 
+    # ===== Redis 缓存配置 =====
+    REDIS_URL: str = "redis://redis:6379/0"
+    REDIS_CACHE_TTL: int = 604800
+
     # ===== 日志配置 =====
     LOG_LEVEL: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     LOG_FORMAT: str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
