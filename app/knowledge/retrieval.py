@@ -41,13 +41,12 @@ RAG_SYNTHESIS_PROMPT = """你是质量检验知识库专家。根据检索文档
 
 async def retrieve_and_synthesize(question: str, session_id: str) -> dict:
     """
-    Flow:
-    1. Check cache with original question (skip rewrite on cache hit)
-    2. Maybe rewrite follow-up question to standalone
-    3. Check cache with rewritten question
-    4. Retrieve from RagFlow + synthesize with LLM
-    5. Cache result under both original and rewritten question keys
-    Returns {"answer": str, "search_question": str}
+    1，先用原始问题检查缓存（如果缓存命中，就跳过重写步骤）
+    2，视情况将后续追问重写成独立的问题
+    3,用重写后的问题再次检查缓存
+    4,从 RagFlow 中检索信息，并结合大语言模型（LLM）生成回答
+    5,将结果分别以原始问题和重写后的问题作为键（key）存入缓存
+    6,最后返回一个包含 answer（回答内容）和 search_question（实际用于搜索的问题）的对象
     """
     # ① 先用原始问题查缓存 — 命中则完全跳过 rewrite 和检索
     cached = await get_cached(question)

@@ -31,7 +31,7 @@ def _is_followup(question: str) -> bool:
 
 
 async def maybe_rewrite(question: str, session_id: str) -> str:
-    """Return a standalone version of question, rewriting follow-ups using history."""
+    """返回问题的独立版本，并结合历史对话将后续追问重写为独立问题."""
     history_context = session_memory.get_context_for_llm(session_id, limit=3)
     if not history_context or not _is_followup(question):
         return question
